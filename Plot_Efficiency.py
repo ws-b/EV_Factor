@@ -35,11 +35,11 @@ files = [f for f in os.listdir(directory) if f.endswith('.csv')]
 needed_cols = [
     'time', 'pack_volt', 'pack_current', 'pack_power_kW',
     'cum_input_kWh', 'cum_output_kWh', 'storage_kWh',
-    'estimated_capacity_kWh', 'init_soc', 'final_soc',
+    'estimated_capacity_kWh', 'estimated_capacity_Ah', 'init_soc', 'final_soc',
     'net_kWh'
 ]
 
-for file in tqdm(files[:3]):
+for file in tqdm(files[70:80]):
     match = re.match(pattern, file)
     if not match:
         print(f"[WARN] 파일명 형식 불일치(전처리 파일 아님): {file}")
@@ -63,7 +63,8 @@ for file in tqdm(files[:3]):
     df.sort_values('time', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    estimated_capacity_kWh = df['estimated_capacity_kWh'].iloc[0]  # 동일값
+    estimated_capacity_kWh = df['estimated_capacity_kWh'].iloc[0]
+    estimated_capacity_Ah = df['estimated_capacity_Ah'].iloc[0]
     init_soc = df['init_soc'].iloc[0]
     final_soc = df['final_soc'].iloc[0]
 
@@ -158,7 +159,7 @@ for file in tqdm(files[:3]):
 
     # (a) storage_kWh
     ax2.plot(df_plot['time'], df_plot['storage_kWh'],
-             color=color_palette[4], alpha=0.5,label='Storage [kWh]')
+             color=color_palette[4], alpha=0.5,label='Storage kWh')
 
     # (b) net_kWh
     ax2.plot(df_plot['time'], df_plot['net_kWh'],
@@ -181,7 +182,8 @@ for file in tqdm(files[:3]):
 
     ax2.set_title(f"Storage / Net / Input / Output\n"
                   f"Init SOC={init_soc:.3f}, Final SOC={final_soc:.3f}, "
-                  f"Estimated Capacity={estimated_capacity_kWh:.2f} kWh")
+                  f"Estimated Capacity={estimated_capacity_kWh:.2f} kWh, "
+                  f"Estimated Capacity={estimated_capacity_Ah:.2f} Ah")
     ax2.set_xlabel("Time")
     ax2.set_ylabel("Energy [kWh]")
     ax2.legend(loc='upper left')

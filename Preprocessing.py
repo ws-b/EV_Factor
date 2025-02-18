@@ -24,6 +24,16 @@ cols_to_keep = [
     "min_deter", "Power_data"
 ]
 
+columns_order = [
+    "time", "speed", "acceleration", "ext_temp", "int_temp", "chrg_cnt",
+    "chrg_cnt_q", "cumul_energy_chrgd", "cumul_energy_chrgd_q", "mod_temp_list",
+    "odometer", "op_time", "soc", "soh", "chrg_cable_conn", "pack_volt", "pack_current",
+    "cell_volt_list", "min_deter", "Power_data", "dt_s", "dt_h", "pack_power_kW",
+    "delta_energy_kWh", "input_kWh", "output_kWh", "cum_input_kWh", "cum_output_kWh",
+    "soc_cc", "init_soc", "final_soc",
+    "estimated_capacity_kWh", "estimated_capacity_Ah", "storage_kWh", "net_kWh"
+]
+
 # ------------------------------------------------
 # (B) OCV-SOC 테이블 로드
 # ------------------------------------------------
@@ -201,7 +211,7 @@ files = [f for f in os.listdir(base_dir) if f.endswith('.csv')]
 # ΔSOC≥30% 구간이 없어 스킵된 파일들 모음
 skipped_files = []
 
-for file in tqdm(files[:3]):
+for file in tqdm(files):
     match = re.match(pattern, file)
     if not match:
         print(f"[WARN] 파일명 형식 불일치: {file}")
@@ -253,6 +263,7 @@ for file in tqdm(files[:3]):
         cap_ah_list = [mr['estimated_capacity_Ah'] for mr in merged_results]
         estimated_capacity_Ah = np.mean(cap_ah_list)
 
+    df['pack_power_kW'] = (df['pack_volt'] * df['pack_current']) / 1000
     df['delta_energy_kWh'] = df['pack_power_kW'] * df['dt_h']
     df['input_kWh'] = np.where(df['pack_power_kW'] < 0,
                                -df['delta_energy_kWh'], 0)
@@ -315,6 +326,10 @@ for file in tqdm(files[:3]):
     df['init_soc'] = init_soc
     df['final_soc'] = final_soc
     df['estimated_capacity_kWh'] = estimated_capacity_kWh
+    df['estimated_capacity_Ah'] = estimated_capacity_Ah
+
+    # 순서배치
+    df = df[columns_order]
 
     out_path = os.path.join(base_dir, file)
     df.to_csv(out_path, index=False)
