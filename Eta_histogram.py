@@ -112,7 +112,7 @@ for file in tqdm(files):
     final_soc = get_soc_from_ocv(final_cell_volt)
     final_storage_kWh = final_soc * battery_capacity_kWh
 
-    # eta = (initial storage + input) / (output + final storage)
+    # eta = (output + final storage) / (initial storage + input)
     denominator = init_storage_kWh + total_input_kWh
     if denominator <= 0:
         # 0 또는 음수면 계산 불가(이상치) → 스킵
