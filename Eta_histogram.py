@@ -34,7 +34,7 @@ files = [f for f in os.listdir(base_dir) if f.endswith('.csv')]
 
 eta_list = []  # 계산된 eta를 저장할 리스트
 
-for file in tqdm(files[:3]):
+for file in tqdm(files):
     match = re.match(pattern, file)
     if not match:
         # 파일명 규칙이 맞지 않는 경우
@@ -113,12 +113,12 @@ for file in tqdm(files[:3]):
     final_storage_kWh = final_soc * battery_capacity_kWh
 
     # eta = (initial storage + input) / (output + final storage)
-    denominator = total_output_kWh + final_storage_kWh
+    denominator = init_storage_kWh + total_input_kWh
     if denominator <= 0:
         # 0 또는 음수면 계산 불가(이상치) → 스킵
         continue
 
-    eta = (init_storage_kWh + total_input_kWh) / denominator
+    eta = (total_output_kWh + final_storage_kWh) / denominator
 
     # 계산된 eta를 리스트에 저장
     eta_list.append(eta)
