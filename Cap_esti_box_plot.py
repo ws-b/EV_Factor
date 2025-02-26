@@ -48,17 +48,18 @@ else:
     terminals = sorted(terminal_data.keys())
 
     # 대표 단말기 번호 5개만 선택 (예: 가장 앞의 5개)
-    if len(terminals) > 15:
-        terminals = terminals[:15]
+    represent_num = 25
+    if len(terminals) > represent_num:
+        terminals = terminals[:represent_num]
 
     data_to_plot = [terminal_data[t] for t in terminals]
 
     # Box Plot으로 시각화
     plt.figure(figsize=(12, 6))
-    plt.boxplot(data_to_plot, labels=terminals, showfliers=False)
+    plt.boxplot(data_to_plot, tick_labels=terminals, showfliers=False)
     plt.xlabel("Device ID")
     plt.ylabel("Estimated Capacity (Ah)")
-    plt.title("Estimated Capacity (Ah), 15 cars")
+    plt.title(f"Estimated Capacity (Ah), {represent_num} cars")
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()

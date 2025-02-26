@@ -20,14 +20,14 @@ cols_to_keep = [
     "time", "speed", "acceleration", "ext_temp", "int_temp",
     "chrg_cnt", "chrg_cnt_q", "cumul_energy_chrgd", "cumul_energy_chrgd_q",
     "mod_temp_list", "odometer", "op_time", "soc", "soh",
-    "chrg_cable_conn", "pack_volt", "pack_current", "cell_volt_list",
+    "chrg_cable_conn", "fast_chrg_port_conn", "pack_volt", "pack_current", "cell_volt_list",
     "min_deter", "Power_data"
 ]
 
 columns_order = [
     "time", "speed", "acceleration", "ext_temp", "int_temp", "chrg_cnt",
     "chrg_cnt_q", "cumul_energy_chrgd", "cumul_energy_chrgd_q", "mod_temp_list",
-    "odometer", "op_time", "soc", "soh", "chrg_cable_conn", "pack_volt", "pack_current",
+    "odometer", "op_time", "soc", "soh", "chrg_cable_conn", "fast_chrg_port_conn", "pack_volt", "pack_current",
     "cell_volt_list", "min_deter", "Power_data", "dt_s", "dt_h", "pack_power_kW",
     "delta_energy_kWh", "input_kWh", "output_kWh", "cum_input_kWh", "cum_output_kWh",
     "soc_cc", "init_soc", "final_soc",

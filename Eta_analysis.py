@@ -9,7 +9,13 @@ from matplotlib.dates import DateFormatter
 # ------------------------------------------------
 # (0) 파라미터 설정 / 색상 팔레트
 # ------------------------------------------------
-base_dir = r"D:\SamsungSTF\Processed_Data\Merged_period\Ioniq5"
+base_dir = r"E:\SamsungSTF\Processed_Data\Merged_period\Ioniq5"
+ocv_file_path = r"D:\SamsungSTF\Data\GSmbiz\NE_SOC_OCV.csv"
+
+REST_GAP_SEC = 7200      # 2시간 (REST 구간 판단 기준)
+THRESHOLD_SEC = 10       # 샘플 간격이 10초보다 크면 max_sec_for_integration 적용
+MAX_SEC_FOR_INTEGRATION = 2
+SOC_USAGE_MIN = 0.30     # ΔSOC 30% 기준
 
 color_palette = [
     "#0073c2",  # 파랑
@@ -24,18 +30,180 @@ color_palette = [
     "#747678"   # 회색
 ]
 
+marker_palette = ['#FF5733', '#33FF57']  # 첫 번째: 초기, 두 번째: 최종
+
 # ------------------------------------------------
-# (1) 파일 목록 읽기
+# (1) OCV-SOC 테이블 로드 및 인터폴레이터 준비
+# ------------------------------------------------
+ocv_df = pd.read_csv(ocv_file_path)  # 컬럼: ['SOC', 'OCV'] (SOC=0~100 가정)
+ocv_soc_array = ocv_df['SOC'].values / 100  # 0~1 범위
+ocv_volt_array = ocv_df['OCV'].values
+
+def get_soc_from_ocv(cell_voltage):
+    """OCV-SOC 커브를 기반으로 SOC 추정 (선형 보간)"""
+    return np.interp(cell_voltage, ocv_volt_array, ocv_soc_array)
+
+# ------------------------------------------------
+# (A) 세그먼트 분할
+# ------------------------------------------------
+def segment_data(df):
+    """
+    시간 간격이 2시간 이상이면 끊음
+    seg = { 'start_idx': s, 'end_idx': e, 'reason': ... }
+    """
+    segs = []
+    n = len(df)
+    if n == 0:
+        return segs
+
+    start_i = 0
+    for i in range(n - 1):
+        time_gap = (df['time'].iloc[i+1] - df['time'].iloc[i]).total_seconds()
+        if time_gap >= REST_GAP_SEC:
+            segs.append({
+                'start_idx': start_i,
+                'end_idx': i+1,
+                'reason': 'rest'
+            })
+            start_i = i+1
+
+    # 마지막 구간
+    if start_i < n:
+        segs.append({
+            'start_idx': start_i,
+            'end_idx': n,
+            'reason': 'end'
+        })
+    return segs
+
+
+# ------------------------------------------------
+# (B) 세그먼트별 SOC/전류적산(Ah) 계산
+#     "마지막 SOC"은 다음 행(df.iloc[e]) 전압 사용 (가능하면)
+#     다음 행이 없으면 => 스킵(return None)
+# ------------------------------------------------
+def compute_segment_info(df, seg):
+    """
+    seg: {'start_idx': s, 'end_idx': e}
+    전류적산은 df.iloc[s:e] 범위
+    최종 SOC 전압 = df.iloc[e]['pack_volt'] (단, e<len(df) 일때만)
+      그렇지 않으면 스킵(return None)
+    """
+    s = seg['start_idx']
+    e = seg['end_idx']
+    n = len(df)
+
+    # 1) e == n 이면 '다음 행'이 존재하지 않으므로 스킵
+    if e >= n:
+        return None
+
+    # 2) 구간 길이도 최소 2는 되어야 함
+    if (e - s) < 2:
+        return None
+
+    # 전류적산용 데이터
+    sub = df.iloc[s:e].copy()
+
+    # cell_count 추정
+    cell_volt_str = sub['cell_volt_list'].iloc[0]
+    cell_list = cell_volt_str.split(',')
+    cell_count = len(cell_list)
+
+    # 초기 SOC => 구간 첫 행
+    first_pack_volt = sub['pack_volt'].iloc[0]
+    init_soc = get_soc_from_ocv(first_pack_volt / cell_count)
+
+    # 최종 SOC => 다음 행 (df.iloc[e])
+    final_pack_volt = df['pack_volt'].iloc[e]
+    final_soc = get_soc_from_ocv(final_pack_volt / cell_count)
+    delta_soc = abs(init_soc - final_soc)
+
+    # 전류적산(Ah)
+    sub['current_ah'] = sub['pack_current'] * sub['dt_h']
+    net_ah = sub['current_ah'].sum()
+
+    # 전류가중 전압
+    sub['voltamp_ah'] = sub['pack_volt'] * sub['current_ah']
+    voltamp_ah = sub['voltamp_ah'].sum()
+
+    return {
+        'start_idx': s,
+        'end_idx': e,
+        'init_soc': init_soc,
+        'final_soc': final_soc,
+        'delta_soc': delta_soc,
+        'net_ah': net_ah,
+        'voltamp_ah': voltamp_ah,
+        'cell_count': cell_count
+    }
+
+
+# ------------------------------------------------
+# (C) 세그먼트 병합 & 용량 추정
+# ------------------------------------------------
+def merge_segments_if_needed(seg_info_list, soc_min=0.30):
+    """
+    seg_info_list = [{...}, ...]
+    ΔSOC >= 30% 넘어가면 Capacity 계산, merged_results에 추가
+    """
+    merged_results = []
+    if not seg_info_list:
+        return merged_results
+
+    def finalize_buffer(buf):
+        net_ah = buf['net_ah']
+        voltamp_ah = buf['voltamp_ah']
+        dsoc = buf['delta_soc']
+
+        if dsoc > 0 and abs(net_ah) > 1e-9:
+            cap_ah = abs(net_ah) / dsoc
+            mean_volt = (voltamp_ah / net_ah)
+            cap_kwh = cap_ah * mean_volt / 1000
+        else:
+            cap_ah = 0
+            cap_kwh = 0
+
+        buf['estimated_capacity_Ah'] = cap_ah
+        buf['estimated_capacity_kWh'] = cap_kwh
+        return buf
+
+    buffer = seg_info_list[0].copy()
+    i = 1
+    n = len(seg_info_list)
+
+    while i < n:
+        current = seg_info_list[i]
+        buffer['end_idx'] = current['end_idx']
+        buffer['final_soc'] = current['final_soc']
+        buffer['delta_soc'] = abs(buffer['init_soc'] - buffer['final_soc'])
+        buffer['net_ah'] += current['net_ah']
+        buffer['voltamp_ah'] += current['voltamp_ah']
+
+        if buffer['delta_soc'] >= soc_min:
+            merged_results.append(finalize_buffer(buffer))
+            if i+1 < n:
+                buffer = seg_info_list[i+1].copy()
+                i += 2
+            else:
+                buffer = None
+                break
+        else:
+            i += 1
+
+    if buffer is not None:
+        if buffer['delta_soc'] >= soc_min:
+            merged_results.append(finalize_buffer(buffer))
+
+    return merged_results
+
+
+# ------------------------------------------------
+# (D) 메인 루프
 # ------------------------------------------------
 pattern = r"(?:bms|bms_altitude)_(\d+)_d(\d+)\.csv"
 files = [f for f in os.listdir(base_dir) if f.endswith('.csv')]
 
-eta_records = []  # (device_id, week, ext_temp_avg, eta)를 저장할 리스트
-
-# ------------------------------------------------
-# (2) 주 파일 순회하여 eta 계산
-# ------------------------------------------------
-for file in tqdm(files[:30]):
+for file in tqdm(files[:10]):
     match = re.match(pattern, file)
     if not match:
         print(f"[WARN] 파일명 형식 불일치: {file}")
@@ -43,212 +211,193 @@ for file in tqdm(files[:30]):
 
     device_id = match.group(1)
     week_idx = int(match.group(2))
-
     file_path = os.path.join(base_dir, file)
 
-    # CSV 로드
     df = pd.read_csv(file_path)
-
-    # (2-1) 외기온도 컬럼이 없으면 스킵(eta 계산이 무의미하진 않지만, 여기서는 예시로 제외)
-    if 'ext_temp' not in df.columns:
-        print(f"[INFO] 'ext_temp' 컬럼이 없어 스킵: {file}")
+    needed_cols = ['time', 'pack_volt', 'pack_current', 'cell_volt_list']
+    if any(col not in df.columns for col in needed_cols):
+        print(f"[WARN] 필수 컬럼({needed_cols})이 없어 스킵: {file}")
         continue
 
-    # ------------------------------------------------
-    # (3) time 처리 (타임스탬프 간격이 너무 큰 경우 2초로 제한)
-    # ------------------------------------------------
     df['time'] = pd.to_datetime(df['time'])
-    df = df.sort_values('time').reset_index(drop=True)
+    df.sort_values('time', inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
     df['dt_s'] = df['time'].diff().dt.total_seconds().fillna(0)
-    threshold_sec = 10
-    max_sec_for_integration = 2
-    df.loc[df['dt_s'] > threshold_sec, 'dt_s'] = max_sec_for_integration
+    df.loc[df['dt_s'] > THRESHOLD_SEC, 'dt_s'] = MAX_SEC_FOR_INTEGRATION
     df['dt_h'] = df['dt_s'] / 3600.0
 
-    # ------------------------------------------------
-    # (4) cell_volt_list 개수로부터 배터리 총용량(Ah) 추정 (예시)
-    # ------------------------------------------------
-    # 만약 컬럼이 비어있거나 NaN이 있을 수 있으므로 예외처리 필요할 수 있음
-    if 'cell_volt_list' not in df.columns or df['cell_volt_list'].isna().all():
-        print(f"[WARN] cell_volt_list가 비어있음. 파일 스킵: {file}")
+    # 세그먼트 분할
+    segments = segment_data(df)
+    if not segments:
+        print(f"[WARN] 세그먼트 분할 결과가 없습니다: {file}")
         continue
 
+    # 세그먼트별 계산
+    seg_info_list = []
+    for seg in segments:
+        info = compute_segment_info(df, seg)
+        if info is not None:
+            seg_info_list.append(info)
+        else:
+            # e == len(df) 등으로 인해 None이면 pass
+            pass
+
+    if not seg_info_list:
+        print(f"[INFO] {file}: 모든 세그먼트가 다음행이 없어 스킵됨.")
+        continue
+
+    merged_results = merge_segments_if_needed(seg_info_list, SOC_USAGE_MIN)
+    if not merged_results:
+        print(f"[INFO] {file}: ΔSOC≥30% 구간 없어 용량 추정 불가, 스킵.")
+        continue
+
+    cap_ah_list = [mr['estimated_capacity_Ah'] for mr in merged_results]
+    cap_kwh_list = [mr['estimated_capacity_kWh'] for mr in merged_results]
+    avg_cap_ah  = np.mean(cap_ah_list)
+    avg_cap_kwh = np.mean(cap_kwh_list)
+
+    print(f"\n[INFO] {file}: 세그먼트별 용량 추정 결과 {len(merged_results)}건")
+    print(f"       [Ah]  평균={avg_cap_ah:.1f}Ah")
+    print(f"       [kWh] 평균={avg_cap_kwh:.2f}kWh")
+    for m in merged_results:
+        print("     - seg({}~{}), ΔSOC={:.1%}, "
+              "Cap={:.1f}Ah ({:.2f}kWh)".format(
+                    m['start_idx'], m['end_idx'],
+                    m['delta_soc'],
+                    m['estimated_capacity_Ah'],
+                    m['estimated_capacity_kWh']))
+
+    estimated_capacity_kWh = avg_cap_kwh
+
+    # ------------------------------------------------
+    # (E) 누적 Input/Output 및 Storage 계산
+    # ------------------------------------------------
+    df['pack_power_kW'] = (df['pack_volt'] * df['pack_current']) / 1000.0
+    df['delta_energy_kWh'] = df['pack_power_kW'] * df['dt_h']
+
+    df['input_kWh'] = np.where(df['pack_power_kW'] < 0,
+                               -df['delta_energy_kWh'], 0)
+    df['output_kWh'] = np.where(df['pack_power_kW'] > 0,
+                                df['delta_energy_kWh'], 0)
+
+    df['cum_input_kWh'] = df['input_kWh'].cumsum()
+    df['cum_output_kWh'] = df['output_kWh'].cumsum()
+
+    # 전체 구간 초기/최종 SOC (OCV)
+    n_df = len(df)
+    if n_df < 15:
+        final_pack_volt = df['pack_volt'].iloc[-1]
+    else:
+        final_pack_volt = df['pack_volt'].iloc[-15]
+
+    # cell_count 간단 추정
     cell_volt_str = df['cell_volt_list'].iloc[0]
-    cell_list = cell_volt_str.split(',')
-    cell_count = len(cell_list)
+    cell_count = len(cell_volt_str.split(','))
+    init_soc = get_soc_from_ocv(df['pack_volt'].iloc[0] / cell_count)
+    final_soc = get_soc_from_ocv(final_pack_volt / cell_count)
 
-    cell_capacity = 55.6  # 셀 1개 당 용량(Ah) (예시)
-    battery_capacity_Ah = cell_capacity * 2  # 2P 구성 가정 (예시)
+    init_storage_kWh = init_soc * estimated_capacity_kWh
+    final_storage_kWh = final_soc * estimated_capacity_kWh
+    df['storage_kWh'] = init_storage_kWh + (df['cum_input_kWh'] - df['cum_output_kWh'])
 
     # ------------------------------------------------
-    # (5) SOC 계산
-    #   - 시작 SOC: df['soc'].iloc[0]
-    #   - 최종 SOC: "마지막 15행" 중 가장 먼저 만나는 유효 SOC(>0) or 마지막행
+    # (F) 시각화 (생략 가능)
     # ------------------------------------------------
-    if 'soc' not in df.columns:
-        print(f"[WARN] soc 컬럼이 없어 스킵: {file}")
-        continue
-
-    # 시작 SOC
-    soc_start = df['soc'].iloc[0]
-
-    # (5-1) 마지막 15행 중 유효 SOC 찾기
-    last_15 = df.iloc[-15:].copy()  # 끝에서 15행
-    # 0이 아니고, NaN이 아닌 SOC
-    valid_soc_rows = last_15[(last_15['soc'].notna()) & (last_15['soc'] != 0)]
-    if not valid_soc_rows.empty:
-        # 가장 앞(상위) 행의 SOC
-        soc_end = valid_soc_rows['soc'].iloc[0]
+    if len(df) > 15:
+        df_plot1 = df.iloc[:-15].copy()
     else:
-        # 15행 모두가 0 또는 NaN이면, 기존 방식대로 마지막행 SOC
-        soc_end = df['soc'].iloc[-1]
+        df_plot1 = df.copy()
 
-    # SOC 범위 체크 (0~100 => 0~1 변환)
-    if df['soc'].max() > 1.0:
-        soc_start /= 100.0
-        soc_end /= 100.0
+    time_margin = pd.Timedelta(hours=5)
+    x_min = df_plot1['time'].min() - time_margin
+    x_max = df_plot1['time'].max() + time_margin
 
-    init_residual_Ah = soc_start * battery_capacity_Ah
-    final_residual_Ah = soc_end * battery_capacity_Ah
+    fig, axes = plt.subplots(6, 1, figsize=(12, 22), sharex=True)
+    fig.suptitle(f"[Device={device_id}, Week={week_idx}]  "
+                 f"Estimated Capacity(Avg)={estimated_capacity_kWh:.2f} kWh\n"
+                 f"Init SOC={init_soc:.3f}, Final SOC={final_soc:.3f}",
+                 fontsize=16)
 
-    # ------------------------------------------------
-    # (6) Charged Q, Discharged Q
-    # ------------------------------------------------
-    if 'pack_current' not in df.columns:
-        print(f"[WARN] pack_current 컬럼이 없어 스킵: {file}")
-        continue
+    axes[0].plot(df_plot1['time'], df_plot1['pack_volt'],
+                 color=color_palette[0], label='Pack Volt [V]')
+    axes[0].set_ylabel("Pack Volt [V]")
+    axes[0].legend(loc='upper left')
 
-    df['dQ'] = df['pack_current'] * df['dt_h']
-    charged_Q_Ah = df.loc[df['dQ'] < 0, 'dQ'].sum() * (-1)
-    discharged_Q_Ah = df.loc[df['dQ'] > 0, 'dQ'].sum()
+    axes[1].plot(df_plot1['time'], df_plot1['pack_current'],
+                 color=color_palette[1], label='Pack Current [A]')
+    axes[1].set_ylabel("Pack Current [A]")
+    axes[1].legend(loc='upper left')
 
-    # ------------------------------------------------
-    # (7) eta 계산
-    # ------------------------------------------------
-    numerator = charged_Q_Ah + init_residual_Ah
-    denominator = discharged_Q_Ah + final_residual_Ah
+    axes[2].plot(df_plot1['time'], df_plot1['cum_input_kWh'],
+                 color=color_palette[2], label='Input [kWh]')
+    axes[2].set_ylabel("Input [kWh]")
+    axes[2].legend(loc='upper left')
 
-    if denominator == 0:
-        eta = np.nan
+    axes[3].plot(df_plot1['time'], df_plot1['cum_output_kWh'],
+                 color=color_palette[3], label='Output [kWh]')
+    axes[3].set_ylabel("Output [kWh]")
+    axes[3].legend(loc='upper left')
+
+    axes[4].plot(df_plot1['time'], df_plot1['storage_kWh'],
+                 color=color_palette[4], label='Storage [kWh]')
+    axes[4].scatter(df_plot1['time'].iloc[0], df_plot1['storage_kWh'].iloc[0],
+                    color=marker_palette[0], marker='o', s=25, zorder=5, label='Init SOC')
+    axes[4].scatter(df_plot1['time'].iloc[-1], df_plot1['storage_kWh'].iloc[-1],
+                    color=marker_palette[1], marker='o', s=25, zorder=5, label='Final SOC')
+    axes[4].set_ylabel("Storage [kWh]")
+    axes[4].legend(loc='upper left')
+
+    axes[5].plot(df_plot1['time'], df_plot1['pack_power_kW'],
+                 color=color_palette[5], label='Pack Power [kW]')
+    axes[5].set_ylabel("Pack Power [kW]")
+    axes[5].set_xlabel("Time")
+    axes[5].legend(loc='upper left')
+
+    date_formatter = DateFormatter('%m-%d %H:%M')
+    axes[-1].xaxis.set_major_formatter(date_formatter)
+    axes[-1].set_xlim(x_min, x_max)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.show()
+
+    # 2번째 플롯
+    if len(df) > 15:
+        df_plot2 = df.iloc[:-15].copy()
     else:
-        eta = numerator / denominator
+        df_plot2 = df.copy()
 
-    # ------------------------------------------------
-    # (8) ext_temp 평균
-    # ------------------------------------------------
-    ext_temp_avg = df['ext_temp'].mean()
+    time_init = df_plot2['time'].iloc[0]
+    time_final_plot = df_plot2['time'].iloc[-1]
+    init_storage_kWh_plot = df_plot2['storage_kWh'].iloc[0]
+    final_storage_kWh_plot = df_plot2['storage_kWh'].iloc[-1]
 
-    eta_records.append((device_id, week_idx, ext_temp_avg, eta))
+    fig2, ax2 = plt.subplots(figsize=(12, 6))
+    ax2.xaxis.set_major_formatter(date_formatter)
 
-# ------------------------------------------------
-# (9) eta_df 생성
-# ------------------------------------------------
-eta_df = pd.DataFrame(eta_records, columns=['device_id', 'week', 'ext_temp_avg', 'eta'])
+    ax2.plot(df_plot2['time'], df_plot2['storage_kWh'],
+             color=color_palette[4], label='Storage [kWh]')
+    ax2.plot(df_plot2['time'], df_plot2['cum_input_kWh'],
+             color=color_palette[2], label='Input [kWh]')
+    ax2.plot(df_plot2['time'], df_plot2['cum_output_kWh'],
+             color=color_palette[3], label='Output [kWh]')
 
-# ------------------------------------------------
-# (10) eta > 1 인 행만 샘플링
-# ------------------------------------------------
-df_over_1 = eta_df[eta_df['eta'] > 1].copy()
-if len(df_over_1) == 0:
-    print("[INFO] eta > 1 인 파일이 없습니다. 종료합니다.")
-else:
-    sample_count = min(5, len(df_over_1))  # 만약 5개보다 적으면 전체 사용
-    df_over_1_sample = df_over_1.sample(sample_count, random_state=42)
+    ax2.scatter(time_init, init_storage_kWh_plot,
+                color=marker_palette[0], marker='o', s=25, zorder=5, label='Init SOC')
+    ax2.scatter(time_final_plot, final_storage_kWh_plot,
+                color=marker_palette[1], marker='o', s=25, zorder=5, label='Final SOC')
 
-    # ------------------------------------------------
-    # (11) 샘플링된 파일들에 대해 서브플롯 시각화
-    # ------------------------------------------------
-    for idx, row in df_over_1_sample.iterrows():
-        device_id = str(row['device_id'])
-        week = int(row['week'])
-        eta_val = row['eta']
+    all_times = pd.concat([df_plot2['time'], pd.Series([time_final_plot])])
+    ax2.set_xlim(all_times.min() - time_margin, all_times.max() + time_margin)
 
-        # 파일명 (예: bms_0000_d1.csv)
-        file_name_bms = f"bms_{device_id}_d{week}.csv"
-        file_path_bms = os.path.join(base_dir, file_name_bms)
+    ax2.set_title(f"Storage / Input / Output\n"
+                  f"Init SOC={init_soc:.3f}, Final SOC={final_soc:.3f}, "
+                  f"Estimated Capacity={estimated_capacity_kWh:.2f} kWh")
+    ax2.set_xlabel("Time")
+    ax2.set_ylabel("Energy [kWh]")
+    ax2.legend(loc='upper left')
 
-        if not os.path.exists(file_path_bms):
-            print(f"[WARN] 해당 파일이 존재하지 않음: {file_name_bms}")
-            continue
-
-        # CSV 로드
-        df_bms = pd.read_csv(file_path_bms)
-        if 'time' not in df_bms.columns:
-            print(f"[WARN] time 컬럼이 없어 스킵: {file_name_bms}")
-            continue
-
-        # time 변환
-        df_bms['time'] = pd.to_datetime(df_bms['time'])
-        df_bms.sort_values('time', inplace=True)
-        df_bms.reset_index(drop=True, inplace=True)
-
-        # dt_s, dt_h 재계산
-        df_bms['dt_s'] = df_bms['time'].diff().dt.total_seconds().fillna(0)
-        threshold_sec = 10
-        max_sec_for_integration = 2
-        df_bms.loc[df_bms['dt_s'] > threshold_sec, 'dt_s'] = max_sec_for_integration
-        df_bms['dt_h'] = df_bms['dt_s'] / 3600.0
-
-        # dQ = pack_current * dt_h
-        if 'pack_current' not in df_bms.columns:
-            print(f"[WARN] pack_current 컬럼이 없어 스킵: {file_name_bms}")
-            continue
-
-        df_bms['dQ'] = df_bms['pack_current'] * df_bms['dt_h']
-
-        # 누적 충/방전량
-        df_bms['charged_Q'] = np.where(df_bms['dQ'] < 0, -df_bms['dQ'], 0)
-        df_bms['discharged_Q'] = np.where(df_bms['dQ'] > 0, df_bms['dQ'], 0)
-        df_bms['cum_charged_Q'] = df_bms['charged_Q'].cumsum()
-        df_bms['cum_discharged_Q'] = df_bms['discharged_Q'].cumsum()
-
-        # 5개 서브플롯
-        fig, axes = plt.subplots(5, 1, figsize=(12, 16), sharex=True)
-        fig.suptitle(f"{device_id}, Week={week}, eta={eta_val:.3f}", fontsize=16)
-
-        # (1) pack_volt
-        if 'pack_volt' in df_bms.columns:
-            axes[0].plot(df_bms['time'], df_bms['pack_volt'],
-                         color=color_palette[0], label='Pack Volt')
-            axes[0].set_ylabel("Pack Volt [V]")
-            axes[0].legend(loc='upper left')
-        else:
-            axes[0].text(0.5, 0.5, 'pack_volt 없음', ha='center', va='center')
-
-        # (2) pack_current
-        axes[1].plot(df_bms['time'], df_bms['pack_current'],
-                     color=color_palette[1], label='Pack Current')
-        axes[1].set_ylabel("Pack Current [A]")
-        axes[1].legend(loc='upper left')
-
-        # (3) soc
-        if 'soc' in df_bms.columns:
-            axes[2].plot(df_bms['time'], df_bms['soc'],
-                         color=color_palette[2], label='SOC')
-            axes[2].set_ylabel("SOC")
-            axes[2].legend(loc='upper left')
-        else:
-            axes[2].text(0.5, 0.5, 'soc 없음', ha='center', va='center')
-
-        # (4) 누적 충전량
-        axes[3].plot(df_bms['time'], df_bms['cum_charged_Q'],
-                     color=color_palette[3], label='Cumulative Charged [Ah]')
-        axes[3].set_ylabel("Charged [Ah]")
-        axes[3].legend(loc='upper left')
-
-        # (5) 누적 방전량
-        axes[4].plot(df_bms['time'], df_bms['cum_discharged_Q'],
-                     color=color_palette[4], label='Cumulative Discharged [Ah]')
-        axes[4].set_ylabel("Discharged [Ah]")
-        axes[4].set_xlabel("Time")
-        axes[4].legend(loc='upper left')
-
-        # x축 시간 포맷
-        date_formatter = DateFormatter('%m-%d %H:%M')
-        axes[4].xaxis.set_major_formatter(date_formatter)
-
-        plt.tight_layout()
-        plt.show()
+    plt.tight_layout()
+    plt.show()
 
 print("\n작업 완료.")
