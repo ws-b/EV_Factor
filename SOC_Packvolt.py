@@ -37,7 +37,7 @@ needed_cols = [
     'net_kWh', 'chrg_cable_conn', 'fast_chrg_port_conn'
 ]
 
-for file in tqdm(files[50:60]):
+for file in tqdm(files[50:54]):
     match = re.match(pattern, file)
     if not match:
         print(f"[WARN] 파일명 형식 불일치(전처리 파일 아님): {file}")
@@ -78,9 +78,9 @@ for file in tqdm(files[50:60]):
     df_charging_fast = df_plot[(df_plot['chrg_cable_conn'] == 1) & (df_plot['fast_chrg_port_conn'] == 1)]
 
     # 각 상태별 SOC 계산 (초기 estimated_capacity_kWh 사용)
-    soc_discharging = (df_discharging['storage_kWh'] / estimated_capacity_kWh) * 100
-    soc_charging_normal = (df_charging_normal['storage_kWh'] / estimated_capacity_kWh) * 100
-    soc_charging_fast = (df_charging_fast['storage_kWh'] / estimated_capacity_kWh) * 100
+    soc_discharging = (df_discharging['soc_cc']) * 100
+    soc_charging_normal = (df_charging_normal['soc_cc']) * 100
+    soc_charging_fast = (df_charging_fast['soc_cc']) * 100
 
     # 플롯 생성
     plt.figure(figsize=(10, 6))
